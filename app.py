@@ -10,6 +10,8 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import logging
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
 
 # ---------------- Logging ----------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -57,15 +59,72 @@ class Changes(BaseModel):
     UpdateOld: List[Endpoint] = Field(default_factory=list)
     Delete: List[Endpoint] = Field(default_factory=list)
 
+    class Config:
+        alias_generator = lambda s: s.lower()  # разрешаем нижний регистр
+        populate_by_name = True
+
 # ---------------- FastAPI app ----------------
 app = FastAPI()
+
+class RequestBodyLoggerMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        method = request.method
+        path = request.url.path
+        query = request.url.query
+        client = getattr(request.client, "host", "-")
+        ctype = request.headers.get("content-type", "-")
+        accept = request.headers.get("accept", "-")
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "REQUEST %s %s%s from %s | content-type=%s accept=%s",
+                method,
+                path,
+                f"?{query}" if query else "",
+                client,
+                ctype,
+                accept,
+            )
+
+            # Считываем тело (и вернём его обратно в поток)
+            try:
+                body_bytes = await request.body()
+                body_text = body_bytes.decode("utf-8", errors="replace")
+                # Логируем компактно: если тело длинное, обрежем
+                max_len = int(os.getenv("LOG_BODY_MAX", "5000"))
+                if len(body_text) > max_len:
+                    logger.debug("REQUEST BODY (%d bytes, truncated): %s...", len(body_text), body_text[:max_len])
+                else:
+                    logger.debug("REQUEST BODY (%d bytes): %s", len(body_text), body_text)
+
+                # восстановим тело для downstream-хендлеров
+                async def receive():
+                    return {"type": "http.request", "body": body_bytes, "more_body": False}
+                request._receive = receive
+            except Exception as e:
+                logger.debug("Failed to read request body: %s", e)
+
+        start = time.time()
+        response = await call_next(request)
+        if logger.isEnabledFor(logging.DEBUG):
+            dur_ms = (time.time() - start) * 1000.0
+            logger.debug("RESPONSE %s %s -> %s (%.1f ms)", method, path, response.status_code, dur_ms)
+
+        return response
+
+app.add_middleware(RequestBodyLoggerMiddleware)
 
 def j(payload) -> JSONResponse:
     return JSONResponse(content=payload, media_type=MEDIA_TYPE)
 
 # ---------------- Utils ----------------
 def _norm_fqdn(s: str) -> str:
+    """Нормализует FQDN - убирает завершающую точку и приводит к нижнему регистру."""
     return s.rstrip(".").lower()
+
+def _ensure_trailing_dot(s: str) -> str:
+    """Добавляет завершающую точку для FQDN если её нет."""
+    return s if s.endswith(".") else s + "."
 
 # external-dns/idna в Go не принимает '*' и '_' в метках -> пропускаем такие записи
 _IDNA_BAD = re.compile(r"[^\w\.\-]", re.ASCII)
@@ -162,17 +221,20 @@ async def _reg_call(path: str, extra: Dict[str, Any]) -> Dict[str, Any]:
         try:
             async with httpx.AsyncClient(verify=REGRU_VERIFY_SSL, timeout=REGRU_TIMEOUT) as client:
                 r = await client.post(url, data=form, headers=headers)
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug("REG.RU RAW RESPONSE [%s] %s", path, r.text)
-                r.raise_for_status()
-                return r.json()
+                logger.debug(f"REG.RU Request: {url} - {form}")
+                logger.debug(f"REG.RU Response: {r.status_code} - {r.text}")
+                
+                if r.status_code != 200:
+                    raise RegruAPIError(f"HTTP error {r.status_code}: {r.text}")
+                    
+                response_data = r.json()
+                if response_data.get("result") != "success":
+                    raise RegruAPIError(f"API error: {response_data}")
+                    
+                return response_data
         except Exception as e:
-            last_err = e
-            if attempt < REGRU_RETRIES:
-                time.sleep(0.5 * (attempt + 1))
-            else:
-                logger.error("REG.RU API ERROR %s: %s", path, e, exc_info=True)
-                raise
+            logger.error(f"REG.RU API call failed: {e}")
+            raise
 
 # ---------------- Cache (very small LRU-ish per zone) ----------------
 # _cache[zone] = {fetched_at, records: List[Endpoint], index: {(sub, type): {targets:Set[str], ttl:int}}}
@@ -224,6 +286,9 @@ async def _ensure_zone_cached(zone: str) -> None:
             ttl = _ttl_to_seconds(rr.get("ttl") or soa_ttl)
 
             content = rr.get("content", "")
+            # Обработка TXT записей - убираем кавычки если они есть
+            if rtype == "TXT" and content.startswith('"') and content.endswith('"'):
+                content = content[1:-1]
             if rtype == "MX":
                 prio = rr.get("prio") or rr.get("priority")
                 host = rr.get("mail_server") or rr.get("target") or (content.split()[-1] if content else "")
@@ -313,7 +378,7 @@ async def adjust(endpoints: List[Endpoint]):
 async def apply(changes: Changes):
     """
     По спецификации Webhook Provider успешный аплай должен вернуть 204 No Content.
-    Никакого тела ответа не возвращаем. :contentReference[oaicite:3]{index=3}
+    Никакого тела ответа не возвращаем.
     """
     desired_add: Dict[Tuple[str, str, str], Set[str]] = {}
     desired_del: Dict[Tuple[str, str, str], Set[str]] = {}
@@ -322,7 +387,13 @@ async def apply(changes: Changes):
         sub, zone = _split_name(ep.dnsName)
         key = (zone, sub, ep.recordType.upper())
         bucket = dct.setdefault(key, set())
+        
+        # Для TXT записей нормализуем цели - убираем кавычки если они есть
         for t in ep.targets:
+            if ep.recordType.upper() == "TXT":
+                t = t.strip()
+                if t.startswith('"') and t.endswith('"'):
+                    t = t[1:-1]
             bucket.add(_norm_fqdn(t))
 
     for ep in changes.Create:
@@ -334,6 +405,7 @@ async def apply(changes: Changes):
     for ep in changes.Delete:
         acc(desired_del, ep)
 
+    # Остальная часть функции без изменений
     touched = {k[0] for k in list(desired_add.keys()) + list(desired_del.keys())}
     for zone in touched:
         await _ensure_zone_cached(zone)
@@ -348,9 +420,13 @@ async def apply(changes: Changes):
             elif rt == "AAAA":
                 add_actions.append({"action": "zone/add_aaaa", "dname": zone, "subdomain": sub, "ipaddr": tgt, "ttl": ttl})
             elif rt == "CNAME":
-                add_actions.append({"action": "zone/add_cname", "dname": zone, "subdomain": sub, "canonical_name": tgt, "ttl": ttl})
+                # REG.RU требует FQDN с точкой в конце для CNAME
+                canonical_name = _ensure_trailing_dot(tgt)
+                add_actions.append({"action": "zone/add_cname", "dname": zone, "subdomain": sub, "canonical_name": canonical_name, "ttl": ttl})
             elif rt == "TXT":
-                add_actions.append({"action": "zone/add_txt", "dname": zone, "subdomain": sub, "text": tgt, "ttl": ttl})
+                # REG.RU ожидает TXT записи в кавычках, если содержат пробелы
+                formatted_txt = f'"{tgt}"' if ' ' in tgt else tgt
+                add_actions.append({"action": "zone/add_txt", "dname": zone, "subdomain": sub, "text": formatted_txt, "ttl": ttl})
             elif rt == "NS":
                 add_actions.append({"action": "zone/add_ns", "dname": zone, "subdomain": sub, "dns_server": tgt, "ttl": ttl})
             elif rt == "MX":
@@ -371,12 +447,26 @@ async def apply(changes: Changes):
                 add_actions.append({"action": "zone/add_txt", "dname": zone, "subdomain": sub, "text": f"UNSUPPORTED:{rt}:{tgt}", "ttl": ttl})
 
     def q_del(zone: str, sub: str, rt: str, targets: Optional[Set[str]]):
-        # Удаление в REG.RU через zone/remove_record, важный параметр subname, а не subdomain. :contentReference[oaicite:4]{index=4}
         if targets:
             for tgt in sorted(targets):
-                del_actions.append({"action": "zone/remove_record", "dname": zone, "record_type": rt, "subname": sub, "content": tgt})
+                # Для TXT записей форматируем также как при добавлении
+                if rt == "TXT":
+                    tgt = f'"{tgt}"' if ' ' in tgt else tgt
+                
+                del_actions.append({
+                    "action": "zone/remove_record", 
+                    "dname": zone, 
+                    "record_type": rt, 
+                    "subname": sub, 
+                    "content": tgt
+                })
         else:
-            del_actions.append({"action": "zone/remove_record", "dname": zone, "record_type": rt, "subname": sub})
+            del_actions.append({
+                "action": "zone/remove_record", 
+                "dname": zone, 
+                "record_type": rt, 
+                "subname": sub
+            })
 
     # вычислить дельту с текущим кэшем
     keys = set(desired_add.keys()) | set(desired_del.keys())
