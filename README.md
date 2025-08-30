@@ -98,7 +98,7 @@ provider:
   name: webhook
 
 extraArgs:
-  - --webhook-provider-url=http://regru-webhook.default.svc.cluster.local:8888
+    - '--webhook-provider-url=http://127.0.0.1:8888'
 
 txtOwnerId: external-dns-demo
 ```
